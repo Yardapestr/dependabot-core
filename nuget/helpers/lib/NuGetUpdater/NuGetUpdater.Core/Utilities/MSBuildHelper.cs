@@ -31,27 +31,52 @@ internal static partial class MSBuildHelper
         // Ensure MSBuild types are registered before calling a method that loads the types
         if (!IsMSBuildRegistered)
         {
-            var candidateDirectories = PathHelper.GetAllDirectoriesToRoot(currentDirectory, rootDirectory);
-            var globalJsonPaths = candidateDirectories.Select(d => Path.Combine(d, "global.json")).Where(File.Exists).Select(p => (p, p + Guid.NewGuid().ToString())).ToArray();
-            foreach (var (globalJsonPath, tempGlobalJsonPath) in globalJsonPaths)
-            {
-                Console.WriteLine($"Temporarily removing `global.json` from `{Path.GetDirectoryName(globalJsonPath)}` for MSBuild detection.");
-                File.Move(globalJsonPath, tempGlobalJsonPath);
-            }
-
-            try
+            SidelineGlobalJsonAsync(currentDirectory, rootDirectory, () =>
             {
                 var defaultInstance = MSBuildLocator.QueryVisualStudioInstances().First();
                 MSBuildPath = defaultInstance.MSBuildPath;
                 MSBuildLocator.RegisterInstance(defaultInstance);
-            }
-            finally
+                return Task.CompletedTask;
+            }).Wait();
+        }
+    }
+
+    public static async Task SidelineGlobalJsonAsync(string currentDirectory, string rootDirectory, Func<Task> action, bool retainMSBuildSdks = false)
+    {
+        var candidateDirectories = PathHelper.GetAllDirectoriesToRoot(currentDirectory, rootDirectory);
+        var globalJsonPaths = candidateDirectories.Select(d => Path.Combine(d, "global.json")).Where(File.Exists).Select(p => (p, p + Guid.NewGuid().ToString())).ToArray();
+        foreach (var (globalJsonPath, tempGlobalJsonPath) in globalJsonPaths)
+        {
+            Console.WriteLine($"Temporarily removing `global.json` from `{Path.GetDirectoryName(globalJsonPath)}`{(retainMSBuildSdks ? " and retaining MSBuild SDK declarations" : string.Empty)}.");
+            File.Move(globalJsonPath, tempGlobalJsonPath);
+            if (retainMSBuildSdks)
             {
-                foreach (var (globalJsonpath, tempGlobalJsonPath) in globalJsonPaths)
+                // custom SDKs might need to be retained for other operations; rebuild `global.json` with only the relevant key
+                var originalContent = await File.ReadAllTextAsync(tempGlobalJsonPath);
+                var jsonNode = JsonHelper.ParseNode(originalContent);
+                if (jsonNode is JsonObject obj &&
+                    obj.TryGetPropertyValue("msbuild-sdks", out var sdks) &&
+                    sdks is not null)
                 {
-                    Console.WriteLine($"Restoring `global.json` to `{Path.GetDirectoryName(globalJsonpath)}` after MSBuild discovery.");
-                    File.Move(tempGlobalJsonPath, globalJsonpath);
+                    var newObj = new JsonObject()
+                    {
+                        ["msbuild-sdks"] = sdks.DeepClone(),
+                    };
+                    await File.WriteAllTextAsync(globalJsonPath, newObj.ToJsonString());
                 }
+            }
+        }
+
+        try
+        {
+            await action();
+        }
+        finally
+        {
+            foreach (var (globalJsonpath, tempGlobalJsonPath) in globalJsonPaths)
+            {
+                Console.WriteLine($"Restoring `global.json` to `{Path.GetDirectoryName(globalJsonpath)}`.");
+                File.Move(tempGlobalJsonPath, globalJsonpath, overwrite: retainMSBuildSdks);
             }
         }
     }
@@ -617,6 +642,16 @@ internal static partial class MSBuildHelper
         if (unauthorizedMessageSnippets.Any(stdout.Contains))
         {
             throw new HttpRequestException(message: stdout, inner: null, statusCode: System.Net.HttpStatusCode.Unauthorized);
+        }
+    }
+
+    internal static void ThrowOnMissingFile(string output)
+    {
+        var missingFilePattern = new Regex(@"The imported project \""(?<FilePath>.*)\"" was not found");
+        var match = missingFilePattern.Match(output);
+        if (match.Success)
+        {
+            throw new MissingFileException(match.Groups["FilePath"].Value);
         }
     }
 

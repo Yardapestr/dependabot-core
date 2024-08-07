@@ -51,12 +51,15 @@ public partial class AnalyzeWorker
             => p.Dependencies.Where(d => !d.IsTransitive &&
                 d.EvaluationResult?.RootPropertyName is not null)
             ).ToImmutableArray();
+        var dotnetToolsHasDependency = discovery.DotNetToolsJson?.Dependencies.Any(d => d.Name.Equals(dependencyInfo.Name, StringComparison.OrdinalIgnoreCase)) == true;
+        var globalJsonHasDependency = discovery.GlobalJson?.Dependencies.Any(d => d.Name.Equals(dependencyInfo.Name, StringComparison.OrdinalIgnoreCase)) == true;
 
         bool usesMultiDependencyProperty = false;
         NuGetVersion? updatedVersion = null;
         ImmutableArray<Dependency> updatedDependencies = [];
 
-        bool isUpdateNecessary = IsUpdateNecessary(dependencyInfo, projectsWithDependency);
+        bool isProjectUpdateNecessary = IsUpdateNecessary(dependencyInfo, projectsWithDependency);
+        var isUpdateNecessary = isProjectUpdateNecessary || dotnetToolsHasDependency || globalJsonHasDependency;
         using var nugetContext = new NuGetContext(startingDirectory);
         AnalysisResult result;
         try
@@ -94,16 +97,35 @@ public partial class AnalyzeWorker
                     CancellationToken.None);
 
                 _logger.Log($"  Finding updated peer dependencies.");
-                updatedDependencies = updatedVersion is not null
-                    ? await FindUpdatedDependenciesAsync(
+                if (updatedVersion is null)
+                {
+                    updatedDependencies = [];
+                }
+                else if (isProjectUpdateNecessary)
+                {
+                    updatedDependencies = await FindUpdatedDependenciesAsync(
                         repoRoot,
                         discovery,
                         dependenciesToUpdate,
                         updatedVersion,
                         nugetContext,
                         _logger,
-                        CancellationToken.None)
-                    : [];
+                        CancellationToken.None);
+                }
+                else if (dotnetToolsHasDependency)
+                {
+                    var infoUrl = await nugetContext.GetPackageInfoUrlAsync(dependencyInfo.Name, updatedVersion.ToNormalizedString(), CancellationToken.None);
+                    updatedDependencies = [new Dependency(dependencyInfo.Name, updatedVersion.ToNormalizedString(), DependencyType.DotNetTool, IsDirect: true, InfoUrl: infoUrl)];
+                }
+                else if (globalJsonHasDependency)
+                {
+                    var infoUrl = await nugetContext.GetPackageInfoUrlAsync(dependencyInfo.Name, updatedVersion.ToNormalizedString(), CancellationToken.None);
+                    updatedDependencies = [new Dependency(dependencyInfo.Name, updatedVersion.ToNormalizedString(), DependencyType.MSBuildSdk, IsDirect: true, InfoUrl: infoUrl)];
+                }
+                else
+                {
+                    throw new InvalidOperationException("Unreachable.");
+                }
 
                 //TODO: At this point we should add the peer dependencies to a queue where
                 // we will analyze them one by one to see if they themselves are part of a
@@ -233,6 +255,12 @@ public partial class AnalyzeWorker
         CancellationToken cancellationToken)
     {
         var versions = versionResult.GetVersions();
+        if (versions.Length == 0)
+        {
+            // if absolutely nothing was found, then we can't update
+            return null;
+        }
+
         var orderedVersions = findLowestVersion
             ? versions.OrderBy(v => v) // If we are fixing a vulnerability, then we want the lowest version that is safe.
             : versions.OrderByDescending(v => v); // If we are just updating versions, then we want the highest version possible.
